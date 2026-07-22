@@ -1,0 +1,25 @@
+# Credenziali e configurazioni private
+.streamlit/secrets.toml
+secrets.toml
+.env
+
+# Dati prodotti dall'app: non devono essere pubblicati
+studio2_data/
+*.sqlite
+*.sqlite3
+*.db
+studio2_risposte.csv
+studio2_risposte.xlsx
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Editor e sistema operativo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
