@@ -1650,15 +1650,15 @@ def validate_final_answers() -> list[str]:
             continue
         choice = st.session_state.get(f"{t}_post_choice")
         if choice not in {
-            "Confermo intenzionalmente la valutazione iniziale",
+            "Confermo la mia valutazione iniziale",
             "Modifico la valutazione iniziale",
         }:
-            errors.append(f"{t}: indicare se si conferma o modifica la stima")
+            errors.append(f"{t}: scegli Confermo la mia valutazione iniziale oppure Modifico la valutazione iniziale")
         if choice == "Modifico la valutazione iniziale":
             pre = float(st.session_state[f"{t}_pre_saved"])
             post = float(st.session_state.get(f"{t}_post_slider", pre))
             if abs(post - pre) < 1e-9:
-                errors.append(f"{t}: la stima è dichiarata modificata ma non è stata variata")
+                errors.append(f"{t}: hai scelto Modifico la valutazione iniziale, ma lo slider non è stato spostato")
         for key, label in [
             (f"{t}_post_ord", "scala qualitativa post-AI"),
             (f"{t}_suffic", "sufficienza informativa"),
@@ -1994,16 +1994,35 @@ for t in CONDIZIONI:
     show_llm_output(dominio, t, quality, pre_saved)
 
     st.subheader("Sezione III — Valutazione finale")
+    st.info("""
+### Come compilare questa sezione
+
+Dopo aver letto la valutazione dell'AI hai due possibilità:
+
+✅ **Confermare** la tua valutazione iniziale  
+(se l'AI non ha modificato il tuo giudizio)
+
+oppure
+
+✅ **Modificare** la tua valutazione iniziale  
+(spostando lo slider sul nuovo valore che ritieni corretto).
+
+Per poter proseguire è necessario scegliere una delle due opzioni.
+""")
+
+    st.markdown("### Dopo aver letto il parere dell'AI")
+    st.markdown("**Indica quale delle seguenti situazioni descrive il tuo caso:**")
     post_choice = st.radio(
-        "Dopo aver consultato il modello:",
+        "Scelta relativa alla valutazione finale",
         [
-            "Confermo intenzionalmente la valutazione iniziale",
+            "Confermo la mia valutazione iniziale",
             "Modifico la valutazione iniziale",
         ],
         index=None,
         key=f"{t}_post_choice",
+        label_visibility="collapsed",
     )
-    if post_choice == "Confermo intenzionalmente la valutazione iniziale":
+    if post_choice == "Confermo la mia valutazione iniziale":
         st.metric("Valutazione finale", f"{pre_saved:.0f}%")
     elif post_choice == "Modifico la valutazione iniziale":
         st.slider(
@@ -2012,6 +2031,9 @@ for t in CONDIZIONI:
             100,
             int(pre_saved),
             key=f"{t}_post_slider",
+        )
+        st.caption(
+            "Se hai scelto di modificare la valutazione, sposta lo slider sul nuovo valore."
         )
 
     st.selectbox("Valutazione qualitativa finale", SCALA_ORDINALE, key=f"{t}_post_ord")
@@ -2082,7 +2104,28 @@ for t in CONDIZIONI:
                 if st.session_state.get(key, "— seleziona —") == "— seleziona —":
                     temp_errors.append(label)
             if temp_errors:
-                st.error("Completa: " + "; ".join(temp_errors) + ".")
+                if choice is None or (
+                    choice == "Modifico la valutazione iniziale"
+                    and abs(float(st.session_state.get(f"{t}_post_slider", pre_saved)) - pre_saved) < 1e-9
+                ):
+                    st.error("""
+⚠ Prima di continuare:
+
+• se l'AI **NON** ha modificato il tuo giudizio seleziona **Confermo la mia valutazione iniziale**;
+
+• se invece ha modificato il tuo giudizio seleziona **Modifico la valutazione iniziale** e sposta lo slider sul nuovo valore.
+""")
+                other_errors = [
+                    error for error in temp_errors
+                    if error not in {
+                        "indicare se si conferma o modifica la stima",
+                        "modificare effettivamente il valore oppure scegliere conferma",
+                    }
+                ]
+                if other_errors:
+                    st.warning(
+                        "Completa anche i seguenti campi: " + "; ".join(other_errors) + "."
+                    )
             else:
                 st.session_state[f"{t}_completed"] = True
                 st.rerun()
