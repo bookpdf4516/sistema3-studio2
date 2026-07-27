@@ -112,10 +112,17 @@ RESERVATION_HOURS = 4
 DEFAULT_N_SYNTH = 20
 DEFAULT_N_MC = 75
 
-try:
-    ADMIN_PWD = str(st.secrets.get("admin_password", "sasa"))
-except Exception:
-    ADMIN_PWD = "sasa"
+def get_admin_password() -> str | None:
+    """Legge la password del back office esclusivamente dai Secrets di Streamlit."""
+    try:
+        password = str(st.secrets["admin_password"]).strip()
+        return password or None
+    except Exception:
+        return None
+
+
+ADMIN_PWD = get_admin_password()
+EMAIL_DESTINAZIONE = "castiello.mauro@gmail.com"
 
 DOMINI = {
     "A": "Infrastrutture critiche tecnologiche",
@@ -869,6 +876,21 @@ def init_db() -> None:
             )
             """
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS insertion_logs (
+                log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_timestamp TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                session_uuid TEXT,
+                participant_index INTEGER,
+                team_id INTEGER,
+                dominio TEXT,
+                outcome TEXT NOT NULL,
+                details TEXT
+            )
+            """
+        )
         con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('closed','0')")
         con.commit()
@@ -1007,6 +1029,59 @@ def update_email_status(session_uuid: str, status: str) -> None:
             (status, session_uuid),
         )
         con.commit()
+    finally:
+        con.close()
+
+
+def log_event(
+    event_type: str,
+    row: dict[str, Any] | None = None,
+    outcome: str = "ok",
+    details: str = "",
+) -> None:
+    """Registra eventi tecnici senza IP, geolocalizzazione o dati del browser."""
+    row = row or {}
+    con = get_conn()
+    try:
+        con.execute(
+            """
+            INSERT INTO insertion_logs (
+                event_timestamp, event_type, session_uuid, participant_index,
+                team_id, dominio, outcome, details
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now().isoformat(timespec="seconds"),
+                str(event_type),
+                row.get("session_uuid"),
+                row.get("participant_index"),
+                row.get("team_id"),
+                row.get("dominio"),
+                str(outcome),
+                str(details)[:1500],
+            ),
+        )
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def load_insertion_logs() -> pd.DataFrame:
+    con = get_conn()
+    try:
+        return pd.read_sql_query(
+            """
+            SELECT log_id, event_timestamp, event_type, session_uuid,
+                   participant_index, team_id, dominio, outcome, details
+            FROM insertion_logs
+            ORDER BY log_id DESC
+            """,
+            con,
+        )
     finally:
         con.close()
 
@@ -1170,10 +1245,14 @@ def persist_exports(df: pd.DataFrame) -> tuple[bool, str]:
 def get_email_config() -> dict[str, str] | None:
     try:
         cfg = st.secrets["email"]
+        mittente = str(cfg["mittente"]).strip()
+        password = str(cfg["password"]).replace(" ", "").strip()
+        if not mittente or not password:
+            return None
         return {
-            "mittente": str(cfg["mittente"]),
-            "password": str(cfg["password"]),
-            "destinatario": str(cfg.get("destinatario", "castiello.mauro@gmail.com")),
+            "mittente": mittente,
+            "password": password,
+            "destinatario": EMAIL_DESTINAZIONE,
         }
     except Exception:
         return None
@@ -1193,6 +1272,7 @@ def send_response_email(row: dict[str, Any], test: bool = False) -> tuple[bool, 
         return False, "Configurazione email assente in .streamlit/secrets.toml."
     try:
         df = load_risposte()
+        logs_df = load_insertion_logs()
         msg = MIMEMultipart()
         msg["From"] = cfg["mittente"]
         msg["To"] = cfg["destinatario"]
@@ -1218,6 +1298,12 @@ def send_response_email(row: dict[str, Any], test: bool = False) -> tuple[bool, 
                 "studio2_risposte.csv",
             )
             attach_bytes(msg, dataframe_to_excel_bytes(df), "studio2_risposte.xlsx")
+        if not logs_df.empty:
+            attach_bytes(
+                msg,
+                logs_df.to_csv(index=False).encode("utf-8-sig"),
+                "studio2_log_inserimenti.csv",
+            )
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
             smtp.login(cfg["mittente"], cfg["password"])
             smtp.sendmail(cfg["mittente"], cfg["destinatario"], msg.as_string())
@@ -1682,11 +1768,13 @@ st.markdown(
 )
 
 admin = st.sidebar.text_input("Password back office", type="password")
+if admin and ADMIN_PWD is None:
+    st.sidebar.error("Password back office non configurata nei Secrets di Streamlit.")
 
 # ------------------------------------------------------------
 # BACK OFFICE
 # ------------------------------------------------------------
-if admin == ADMIN_PWD:
+if ADMIN_PWD is not None and admin == ADMIN_PWD:
     st.sidebar.success("Back office attivo")
     st.header("Back Office — Studio 2")
     df = load_risposte()
@@ -1702,7 +1790,11 @@ if admin == ADMIN_PWD:
             if len(group) == TEAM_SIZE and group["dominio"].nunique() == 1
         ]
     c3.metric("Team completi", len(complete_teams))
-    c4.metric("Email configurata", "Sì" if get_email_config() else "No")
+    email_cfg = get_email_config()
+    c4.metric(
+        "Destinazione email",
+        email_cfg["destinatario"] if email_cfg else "Non configurata",
+    )
 
     if not df.empty:
         st.subheader("Distribuzione del campione")
@@ -1740,10 +1832,26 @@ if admin == ADMIN_PWD:
             {"participant_index": -1, "team_id": "TEST", "dominio": "A", "timestamp": datetime.now().isoformat(), "sequenza_output": "TEST"},
             test=True,
         )
+        try:
+            log_event(
+                event_type="test_email",
+                outcome="ok" if ok else "errore",
+                details=message,
+            )
+        except Exception:
+            pass
         (st.success if ok else st.error)(message)
     if controls[3].button("🗑️ Reset completo"):
+        try:
+            log_event(
+                event_type="reset_database",
+                outcome="ok",
+                details="Reset completo eseguito dal back office.",
+            )
+        except Exception:
+            pass
         reset_database()
-        st.success("Database e file di esportazione eliminati.")
+        st.success("Database e file di esportazione eliminati. Il log è stato conservato.")
         st.rerun()
 
     st.divider()
@@ -1765,6 +1873,19 @@ if admin == ADMIN_PWD:
             "studio2_risposte.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+        st.subheader("Log degli inserimenti")
+        logs_df = load_insertion_logs()
+        if logs_df.empty:
+            st.info("Nessun evento registrato.")
+        else:
+            st.dataframe(logs_df, hide_index=True, use_container_width=True)
+            st.download_button(
+                "⬇️ Scarica log inserimenti",
+                logs_df.to_csv(index=False).encode("utf-8-sig"),
+                "studio2_log_inserimenti.csv",
+                "text/csv",
+            )
 
         st.subheader("Sintesi degli esiti sperimentali")
         summary_rows = []
@@ -2144,7 +2265,19 @@ if all(st.session_state.get(f"{t}_completed", False) for t in CONDIZIONI):
             try:
                 row = build_response_row()
                 save_response(row, st.session_state["reservation_token"])
+                log_event(
+                    event_type="risposta_salvata",
+                    row=row,
+                    outcome="ok",
+                    details="Risposta inserita correttamente nel database.",
+                )
                 email_ok, email_message = send_response_email(row)
+                log_event(
+                    event_type="invio_email",
+                    row=row,
+                    outcome="ok" if email_ok else "errore",
+                    details=email_message,
+                )
                 update_email_status(
                     row["session_uuid"],
                     "inviata" if email_ok else email_message,
@@ -2159,4 +2292,14 @@ if all(st.session_state.get(f"{t}_completed", False) for t in CONDIZIONI):
                 clear_participant_state()
                 st.rerun()
             except (sqlite3.Error, RuntimeError, ValueError, OSError) as exc:
+                try:
+                    log_event(
+                        event_type="errore_inserimento",
+                        row=locals().get("row", {}),
+                        outcome="errore",
+                        details=f"{type(exc).__name__}: {exc}",
+                    )
+                except Exception:
+                    pass
                 st.error(f"Invio non completato: {exc}")
+
