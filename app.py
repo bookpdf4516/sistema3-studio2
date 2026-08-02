@@ -911,6 +911,42 @@ di golden power prima che questa analisi sia completata.""",
 },
 }
 
+
+# ============================================================
+# CONTROBILANCIAMENTO DELLA QUALITÀ DELL'OUTPUT LLM
+# ============================================================
+
+SEQUENZE_QUALITA = {
+    "S1": {
+        "T1": "calibrato",
+        "T2": "sovrastimante",
+        "T3": "sottostimante",
+    },
+    "S2": {
+        "T1": "sottostimante",
+        "T2": "calibrato",
+        "T3": "sovrastimante",
+    },
+    "S3": {
+        "T1": "sovrastimante",
+        "T2": "sottostimante",
+        "T3": "calibrato",
+    },
+}
+
+# Benchmark operativi preliminari, da validare con un panel indipendente.
+EXPERT_BENCHMARK = {
+    "A": {"T1": 35, "T2": 68, "T3": 88},
+    "B": {"T1": 40, "T2": 67, "T3": 90},
+    "C": {"T1": 45, "T2": 72, "T3": 90},
+}
+
+QUALITY_SHIFT = {
+    "calibrato": 0,
+    "sovrastimante": 20,
+    "sottostimante": -20,
+}
+
 SCALA_ORDINALE = [
     "— seleziona —",
     "No — nessuna evidenza",
