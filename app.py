@@ -137,23 +137,14 @@ TEAM_DOMAIN_ORDER = ["A", "A", "A", "A", "B", "B", "B", "C", "C", "C"]
 # non la sequenza temporale dei briefing.
 CONDIZIONI = ["T1", "T2", "T3"]
 COND_LABEL = {
-    "T1": "Configurazione α — Sessione analitica ordinaria",
-    "T2": "Configurazione β — Sessione analitica straordinaria",
-    "T3": "Configurazione γ — Sessione analitica di crisi",
+    "T1": "Configurazione α",
+    "T2": "Configurazione β",
+    "T3": "Configurazione γ",
 }
 COND_CONTESTO = {
-    "T1": (
-        "**Configurazione α** — Il team opera in condizioni standard. "
-        "Non è richiesta una decisione operativa immediata."
-    ),
-    "T2": (
-        "**Configurazione β** — Il quadro informativo si è evoluto. "
-        "Il tempo di analisi è ridotto e la sintesi è richiesta con urgenza."
-    ),
-    "T3": (
-        "**Configurazione γ** — Il quadro richiede una valutazione immediata. "
-        "La decisione deve essere formulata prima del completamento di tutte le verifiche."
-    ),
+    "T1": "",
+    "T2": "",
+    "T3": "",
 }
 
 DOMANDA = {
@@ -2075,38 +2066,22 @@ def figure_to_png(fig: plt.Figure, dpi: int = 300) -> bytes:
 # ============================================================
 
 
-def relative_ai_message(pre: float, reference: float) -> str:
-    diff = int(round(reference - pre))
-    if diff > 0:
-        return (
-            f"La stima complessiva prodotta dal sistema è **superiore** alla tua "
-            f"valutazione iniziale di **{diff} punti percentuali**."
-        )
-    if diff < 0:
-        return (
-            f"La stima complessiva prodotta dal sistema è **inferiore** alla tua "
-            f"valutazione iniziale di **{abs(diff)} punti percentuali**."
-        )
-    return "La stima complessiva prodotta dal sistema è **allineata** alla tua valutazione iniziale."
 
+def show_llm_output(dominio: str, t: str, quality: str) -> dict[str, Any]:
+    """Mostra al partecipante soltanto l'analisi argomentata del modello.
 
-def show_llm_output(dominio: str, t: str, quality: str, pre: float) -> dict[str, Any]:
+    La stima quantitativa, la valutazione ordinale e la qualità sperimentale
+    dell'output restano nascoste nell'interfaccia e vengono conservate nel
+    database esclusivamente per le successive analisi.
+    """
     output = llm_output(dominio, t, quality)
     st.info(
         "**Sistema di supporto analitico — output precompilato del modello linguistico**\n\n"
         "Il modello ha elaborato le stesse informazioni del briefing e presenta "
-        "la propria analisi in forma strutturata."
+        "la propria analisi argomentata."
     )
-    st.markdown(f"### Valutazione complessiva\n**{output['ordinal']}**")
-    st.markdown(relative_ai_message(pre, output["reference"]))
-    indicator_df = pd.DataFrame(output["indicators"], columns=["Indicatore", "Peso attribuito"])
-    st.dataframe(indicator_df, hide_index=True, use_container_width=True)
-    c1, c2 = st.columns(2)
-    c1.metric("Coerenza tra le fonti", str(output["coherence"]).capitalize())
-    c2.metric("Incertezza residua", str(output["uncertainty"]).capitalize())
     st.markdown("### Analisi argomentata")
     st.markdown(output["analysis"])
-    st.caption("Il giudizio analitico finale rimane responsabilità del partecipante.")
     return output
 
 
@@ -2146,6 +2121,9 @@ def build_response_row() -> dict[str, Any]:
         post_choice = str(st.session_state.get(f"{t}_post_choice"))
         post = pre if post_choice.startswith("Confermo") else float(st.session_state[f"{t}_post_slider"])
         values = {
+            # Variabili sperimentali interne: non sono mostrate al partecipante,
+            # ma vengono conservate per ricostruire la condizione assegnata
+            # e calcolare affidamento appropriato e resa cognitiva.
             "output_quality": quality,
             "ai_reference": float(output["reference"]),
             "ai_ordinal": output["ordinal"],
@@ -2568,7 +2546,8 @@ for t in CONDIZIONI:
         st.info("🔒 Completa la condizione precedente per proseguire.")
         continue
 
-    st.info(COND_CONTESTO[t])
+    if COND_CONTESTO[t]:
+        st.info(COND_CONTESTO[t])
     with st.expander("📄 Briefing operativo", expanded=not st.session_state.get(f"{t}_confirmed", False)):
         st.markdown(BRIEFING[dominio][t])
 
@@ -2594,7 +2573,7 @@ for t in CONDIZIONI:
     quality = SEQUENZE_QUALITA[sequence][t]
     st.success("Valutazione iniziale registrata.")
     st.subheader("Sezione II — Output del modello linguistico")
-    show_llm_output(dominio, t, quality, pre_saved)
+    show_llm_output(dominio, t, quality)
 
     st.subheader("Sezione III — Valutazione finale")
     st.info("""
