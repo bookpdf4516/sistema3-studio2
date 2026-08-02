@@ -1,4 +1,4 @@
- """
+"""
 Studio 2 — Sistema 3 come filtro selettivo della resa cognitiva
 ================================================================
 
