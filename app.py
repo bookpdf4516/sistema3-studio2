@@ -40,6 +40,8 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
 
 
 def _ensure_streamlit_runtime() -> None:
@@ -1288,9 +1290,228 @@ def expected_columns() -> OrderedDict[str, str]:
 
 
 def get_conn() -> sqlite3.Connection:
+    """Connessione SQLite locale, usata come copia operativa temporanea."""
     con = sqlite3.connect(str(DB_PATH), timeout=30)
     con.row_factory = sqlite3.Row
     return con
+
+
+# ============================================================
+# ARCHIVIO PERSISTENTE GOOGLE SHEETS
+# ============================================================
+
+RISPOSTE_SHEET = "Risposte"
+PRENOTAZIONI_SHEET = "Prenotazioni"
+LOG_SHEET = "Log"
+
+PRENOTAZIONI_HEADERS = [
+    "session_token",
+    "participant_index",
+    "created_at",
+    "status",
+    "completed_at",
+]
+
+LOG_HEADERS = [
+    "event_timestamp",
+    "event_type",
+    "session_uuid",
+    "participant_index",
+    "team_id",
+    "dominio",
+    "outcome",
+    "details",
+]
+
+
+def _google_credentials_info() -> tuple[dict[str, str], str]:
+    """Costruisce le credenziali senza richiedere che tutti i campi siano nei Secrets."""
+    try:
+        cfg = dict(st.secrets["google_sheets"])
+    except Exception as exc:
+        raise RuntimeError(
+            "Configurazione Google Sheets assente nei Secrets di Streamlit."
+        ) from exc
+
+    spreadsheet_id = str(cfg.pop("spreadsheet_id", "")).strip()
+    if not spreadsheet_id:
+        raise RuntimeError("spreadsheet_id non configurato nei Secrets.")
+
+    required = ("project_id", "private_key", "client_email")
+    missing = [field for field in required if not str(cfg.get(field, "")).strip()]
+    if missing:
+        raise RuntimeError(
+            "Credenziali Google Sheets incomplete: " + ", ".join(missing)
+        )
+
+    private_key = str(cfg["private_key"])
+    cfg["private_key"] = private_key.replace("\\n", "\n")
+    cfg.setdefault("type", "service_account")
+    cfg.setdefault("token_uri", "https://oauth2.googleapis.com/token")
+    cfg.setdefault("auth_uri", "https://accounts.google.com/o/oauth2/auth")
+    cfg.setdefault(
+        "auth_provider_x509_cert_url",
+        "https://www.googleapis.com/oauth2/v1/certs",
+    )
+    return {str(k): str(v) for k, v in cfg.items()}, spreadsheet_id
+
+
+@st.cache_resource(show_spinner=False)
+def get_google_spreadsheet():
+    """Apre il foglio persistente condiviso con il service account."""
+    credentials_info, spreadsheet_id = _google_credentials_info()
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    try:
+        credentials = Credentials.from_service_account_info(
+            credentials_info,
+            scopes=scopes,
+        )
+        client = gspread.authorize(credentials)
+        return client.open_by_key(spreadsheet_id)
+    except Exception as exc:
+        raise RuntimeError(
+            "Impossibile collegarsi a Google Sheets. "
+            "Verifica Secrets, condivisione del foglio e API abilitate."
+        ) from exc
+
+
+def _worksheet(name: str, headers: list[str]):
+    """Restituisce un worksheet e crea/verifica la riga delle intestazioni."""
+    spreadsheet = get_google_spreadsheet()
+    try:
+        ws = spreadsheet.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(
+            title=name,
+            rows=max(200, MAX_P + 20),
+            cols=max(20, len(headers) + 5),
+        )
+
+    first_row = ws.row_values(1)
+    if not first_row:
+        ws.append_row(headers, value_input_option="RAW")
+    elif first_row != headers:
+        # Per Risposte consente l'estensione dello schema senza eliminare dati.
+        if name == RISPOSTE_SHEET:
+            missing = [h for h in headers if h not in first_row]
+            if missing:
+                merged = first_row + missing
+                ws.update(
+                    range_name=f"A1:{gspread.utils.rowcol_to_a1(1, len(merged))}",
+                    values=[merged],
+                    value_input_option="RAW",
+                )
+        else:
+            raise RuntimeError(
+                f"Le intestazioni del foglio '{name}' non corrispondono allo script."
+            )
+    return ws
+
+
+def get_risposte_sheet():
+    return _worksheet(RISPOSTE_SHEET, list(expected_columns().keys()))
+
+
+def get_prenotazioni_sheet():
+    return _worksheet(PRENOTAZIONI_SHEET, PRENOTAZIONI_HEADERS)
+
+
+def get_log_sheet():
+    return _worksheet(LOG_SHEET, LOG_HEADERS)
+
+
+def _sheet_records(ws) -> list[dict[str, Any]]:
+    try:
+        return ws.get_all_records(
+            default_blank="",
+            numericise_ignore=["all"],
+        )
+    except TypeError:
+        # Compatibilità con versioni meno recenti di gspread.
+        return ws.get_all_records(default_blank="")
+
+
+def _clean_sheet_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return "" if np.isnan(value) else float(value)
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return value
+
+
+def _append_dict(ws, row: dict[str, Any], headers: list[str]) -> None:
+    ws.append_row(
+        [_clean_sheet_value(row.get(column, "")) for column in headers],
+        value_input_option="RAW",
+    )
+
+
+def _find_row_by_value(ws, column_name: str, value: Any) -> tuple[int, dict[str, Any]] | None:
+    headers = ws.row_values(1)
+    if column_name not in headers:
+        return None
+    records = _sheet_records(ws)
+    target = str(value)
+    for row_number, record in enumerate(records, start=2):
+        if str(record.get(column_name, "")) == target:
+            return row_number, record
+    return None
+
+
+def _update_sheet_cell_by_header(ws, row_number: int, header: str, value: Any) -> None:
+    headers = ws.row_values(1)
+    if header not in headers:
+        raise RuntimeError(f"Colonna '{header}' assente nel foglio '{ws.title}'.")
+    ws.update_cell(row_number, headers.index(header) + 1, _clean_sheet_value(value))
+
+
+def _sync_row_to_local_sqlite(row: dict[str, Any]) -> None:
+    """Copia locale non autoritativa; eventuali errori non compromettono Google Sheets."""
+    con = get_conn()
+    try:
+        cols = list(row.keys())
+        col_sql = ",".join(f'"{c}"' for c in cols)
+        placeholders = ",".join("?" for _ in cols)
+        con.execute(
+            f"INSERT OR REPLACE INTO risposte ({col_sql}) VALUES ({placeholders})",
+            [row[c] for c in cols],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _sync_reservation_to_local(
+    session_token: str,
+    participant_index: int,
+    created_at: str,
+    completed: int = 0,
+) -> None:
+    con = get_conn()
+    try:
+        con.execute(
+            """
+            INSERT OR REPLACE INTO reservations(
+                session_token, participant_index, created_at, completed
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (session_token, participant_index, created_at, completed),
+        )
+        con.commit()
+    finally:
+        con.close()
 
 
 def init_db() -> None:
@@ -1341,126 +1562,241 @@ def init_db() -> None:
 
 
 def load_risposte() -> pd.DataFrame:
-    con = get_conn()
-    try:
-        return pd.read_sql_query(
-            "SELECT * FROM risposte ORDER BY participant_index, timestamp", con
-        )
-    finally:
-        con.close()
+    """Carica le risposte dall'archivio persistente Google Sheets."""
+    ws = get_risposte_sheet()
+    records = _sheet_records(ws)
+    columns = list(expected_columns().keys())
+    if not records:
+        return pd.DataFrame(columns=columns)
+
+    df = pd.DataFrame(records)
+    for column in columns:
+        if column not in df.columns:
+            df[column] = np.nan
+    df = df[columns]
+
+    for column in ["participant_index", "team_id", "posizione_team"]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    return df.sort_values(
+        ["participant_index", "timestamp"],
+        na_position="last",
+    ).reset_index(drop=True)
 
 
 def completed_count() -> int:
-    con = get_conn()
-    try:
-        row = con.execute("SELECT COUNT(*) FROM risposte").fetchone()
-        return int(row[0])
-    finally:
-        con.close()
+    df = load_risposte()
+    if df.empty or "session_uuid" not in df.columns:
+        return 0
+    return int(df["session_uuid"].astype(str).replace("", np.nan).dropna().nunique())
+
+
+def _latest_collection_state() -> bool | None:
+    """Restituisce True=chiusa, False=aperta, None=nessuna impostazione."""
+    ws = get_log_sheet()
+    records = _sheet_records(ws)
+    for record in reversed(records):
+        event = str(record.get("event_type", ""))
+        if event == "rilevazione_chiusa":
+            return True
+        if event == "rilevazione_aperta":
+            return False
+    return None
 
 
 def is_closed() -> bool:
-    con = get_conn()
-    try:
-        row = con.execute("SELECT value FROM settings WHERE key='closed'").fetchone()
-        return bool(row and row[0] == "1")
-    finally:
-        con.close()
+    explicit = _latest_collection_state()
+    if explicit is not None:
+        return explicit
+    return completed_count() >= MAX_P
 
 
 def set_closed(value: bool) -> None:
-    con = get_conn()
-    try:
-        con.execute(
-            "INSERT OR REPLACE INTO settings(key,value) VALUES ('closed',?)",
-            ("1" if value else "0",),
-        )
-        con.commit()
-    finally:
-        con.close()
+    log_event(
+        event_type="rilevazione_chiusa" if value else "rilevazione_aperta",
+        outcome="ok",
+        details="Impostazione persistente salvata su Google Sheets.",
+    )
+
+
+def _active_and_completed_indices() -> tuple[set[int], set[int]]:
+    responses = load_risposte()
+    completed: set[int] = set()
+    if not responses.empty and "participant_index" in responses.columns:
+        completed = {
+            int(value)
+            for value in pd.to_numeric(
+                responses["participant_index"], errors="coerce"
+            ).dropna()
+        }
+
+    now = datetime.now()
+    threshold = now - timedelta(hours=RESERVATION_HOURS)
+    reservations = _sheet_records(get_prenotazioni_sheet())
+    active: set[int] = set()
+
+    for record in reservations:
+        status = str(record.get("status", "")).strip().lower()
+        if status != "attiva":
+            continue
+        try:
+            created_at = datetime.fromisoformat(str(record.get("created_at", "")))
+            participant_index = int(record.get("participant_index"))
+        except (TypeError, ValueError):
+            continue
+        if created_at >= threshold and participant_index not in completed:
+            active.add(participant_index)
+
+    return completed, active
 
 
 def reserve_slot() -> tuple[str, int]:
-    token = str(uuid.uuid4())
-    threshold = (datetime.now() - timedelta(hours=RESERVATION_HOURS)).isoformat(timespec="seconds")
-    con = get_conn()
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        con.execute(
-            "DELETE FROM reservations WHERE completed=0 AND created_at < ?",
-            (threshold,),
+    """Riserva uno slot persistente; risolve anche rare collisioni simultanee."""
+    ws = get_prenotazioni_sheet()
+
+    for attempt in range(8):
+        token = str(uuid.uuid4())
+        created_at = datetime.now().isoformat(timespec="microseconds")
+        completed, active = _active_and_completed_indices()
+        available = next(
+            (i for i in range(MAX_P) if i not in completed and i not in active),
+            None,
         )
-        completed = {
-            int(row[0])
-            for row in con.execute(
-                "SELECT participant_index FROM risposte WHERE participant_index IS NOT NULL"
-            ).fetchall()
-        }
-        active = {
-            int(row[0])
-            for row in con.execute(
-                "SELECT participant_index FROM reservations WHERE completed=0"
-            ).fetchall()
-        }
-        available = next((i for i in range(MAX_P) if i not in completed and i not in active), None)
         if available is None:
             raise RuntimeError("Non sono disponibili ulteriori slot per la rilevazione.")
-        con.execute(
-            "INSERT INTO reservations(session_token,participant_index,created_at,completed) "
-            "VALUES (?,?,?,0)",
-            (token, available, datetime.now().isoformat(timespec="seconds")),
+
+        _append_dict(
+            ws,
+            {
+                "session_token": token,
+                "participant_index": available,
+                "created_at": created_at,
+                "status": "attiva",
+                "completed_at": "",
+            },
+            PRENOTAZIONI_HEADERS,
         )
-        con.commit()
-        return token, int(available)
-    except Exception:
-        con.rollback()
-        raise
-    finally:
-        con.close()
+
+        # Controllo anti-collisione: per lo stesso indice vince la prenotazione
+        # attiva con timestamp più antico; le altre ritentano su un nuovo indice.
+        records = _sheet_records(ws)
+        contenders: list[tuple[str, str, int]] = []
+        for row_number, record in enumerate(records, start=2):
+            try:
+                same_index = int(record.get("participant_index")) == int(available)
+            except (TypeError, ValueError):
+                same_index = False
+            if same_index and str(record.get("status", "")).lower() == "attiva":
+                contenders.append(
+                    (
+                        str(record.get("created_at", "")),
+                        str(record.get("session_token", "")),
+                        row_number,
+                    )
+                )
+
+        contenders.sort(key=lambda item: (item[0], item[1]))
+        if contenders and contenders[0][1] == token:
+            try:
+                _sync_reservation_to_local(token, int(available), created_at, 0)
+            except Exception:
+                pass
+            return token, int(available)
+
+        own = next((item for item in contenders if item[1] == token), None)
+        if own:
+            _update_sheet_cell_by_header(ws, own[2], "status", "annullata_collisione")
+
+    raise RuntimeError(
+        "Non è stato possibile riservare uno slot a causa di accessi simultanei. "
+        "Riprova tra pochi secondi."
+    )
 
 
 def save_response(row: dict[str, Any], reservation_token: str) -> None:
+    """Salva prima su Google Sheets e poi crea una copia locale SQLite."""
     expected = expected_columns()
     unknown = set(row) - set(expected)
     if unknown:
         raise ValueError(f"Colonne non previste: {sorted(unknown)}")
 
-    con = get_conn()
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        reservation = con.execute(
-            "SELECT participant_index, completed FROM reservations WHERE session_token=?",
-            (reservation_token,),
-        ).fetchone()
-        if not reservation:
-            raise RuntimeError("Prenotazione non trovata o scaduta.")
-        if int(reservation[1]) == 1:
-            raise RuntimeError("Questa sessione è già stata inviata.")
-        if int(reservation[0]) != int(row["participant_index"]):
-            raise RuntimeError("Lo slot della sessione non coincide con la risposta.")
+    reservations_ws = get_prenotazioni_sheet()
+    reservation_match = _find_row_by_value(
+        reservations_ws,
+        "session_token",
+        reservation_token,
+    )
+    if not reservation_match:
+        raise RuntimeError("Prenotazione non trovata o scaduta.")
 
-        cols = list(row.keys())
-        col_sql = ",".join(f'"{c}"' for c in cols)
-        placeholders = ",".join("?" for _ in cols)
-        con.execute(
-            f"INSERT INTO risposte ({col_sql}) VALUES ({placeholders})",
-            [row[c] for c in cols],
+    reservation_row_number, reservation = reservation_match
+    status = str(reservation.get("status", "")).strip().lower()
+    if status == "completata":
+        raise RuntimeError("Questa sessione è già stata inviata.")
+    if status != "attiva":
+        raise RuntimeError("La prenotazione non è più attiva.")
+
+    try:
+        reserved_index = int(reservation.get("participant_index"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Indice della prenotazione non valido.") from exc
+
+    if reserved_index != int(row["participant_index"]):
+        raise RuntimeError("Lo slot della sessione non coincide con la risposta.")
+
+    responses_ws = get_risposte_sheet()
+    session_uuid = str(row.get("session_uuid", ""))
+    if session_uuid and _find_row_by_value(responses_ws, "session_uuid", session_uuid):
+        raise RuntimeError("Questa risposta risulta già acquisita.")
+
+    existing_index = _find_row_by_value(
+        responses_ws,
+        "participant_index",
+        int(row["participant_index"]),
+    )
+    if existing_index:
+        raise RuntimeError(
+            "Lo slot risulta già completato da un'altra risposta. "
+            "Contatta il responsabile della rilevazione."
         )
-        con.execute(
-            "UPDATE reservations SET completed=1 WHERE session_token=?",
-            (reservation_token,),
+
+    headers = responses_ws.row_values(1)
+    _append_dict(responses_ws, row, headers)
+
+    _update_sheet_cell_by_header(
+        reservations_ws,
+        reservation_row_number,
+        "status",
+        "completata",
+    )
+    _update_sheet_cell_by_header(
+        reservations_ws,
+        reservation_row_number,
+        "completed_at",
+        datetime.now().isoformat(timespec="seconds"),
+    )
+
+    try:
+        _sync_row_to_local_sqlite(row)
+        _sync_reservation_to_local(
+            reservation_token,
+            int(row["participant_index"]),
+            str(reservation.get("created_at", "")),
+            1,
         )
-        if int(row["participant_index"]) + 1 >= MAX_P:
-            con.execute("UPDATE settings SET value='1' WHERE key='closed'")
-        con.commit()
     except Exception:
-        con.rollback()
-        raise
-    finally:
-        con.close()
+        # Google Sheets è l'archivio autoritativo; la copia SQLite è secondaria.
+        pass
 
 
 def update_email_status(session_uuid: str, status: str) -> None:
+    ws = get_risposte_sheet()
+    match = _find_row_by_value(ws, "session_uuid", session_uuid)
+    if match:
+        row_number, _ = match
+        _update_sheet_cell_by_header(ws, row_number, "email_status", status)
+
     con = get_conn()
     try:
         con.execute(
@@ -1478,8 +1814,22 @@ def log_event(
     outcome: str = "ok",
     details: str = "",
 ) -> None:
-    """Registra eventi tecnici senza IP, geolocalizzazione o dati del browser."""
+    """Registra eventi tecnici persistenti senza metadati del browser."""
     row = row or {}
+    event_row = {
+        "event_timestamp": datetime.now().isoformat(timespec="seconds"),
+        "event_type": str(event_type),
+        "session_uuid": row.get("session_uuid", ""),
+        "participant_index": row.get("participant_index", ""),
+        "team_id": row.get("team_id", ""),
+        "dominio": row.get("dominio", ""),
+        "outcome": str(outcome),
+        "details": str(details)[:1500],
+    }
+
+    _append_dict(get_log_sheet(), event_row, LOG_HEADERS)
+
+    # Copia locale secondaria.
     con = get_conn()
     try:
         con.execute(
@@ -1490,42 +1840,32 @@ def log_event(
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                datetime.now().isoformat(timespec="seconds"),
-                str(event_type),
-                row.get("session_uuid"),
-                row.get("participant_index"),
-                row.get("team_id"),
-                row.get("dominio"),
-                str(outcome),
-                str(details)[:1500],
-            ),
+            tuple(event_row[column] for column in LOG_HEADERS),
         )
         con.commit()
-    except Exception:
-        con.rollback()
-        raise
     finally:
         con.close()
 
 
 def load_insertion_logs() -> pd.DataFrame:
-    con = get_conn()
-    try:
-        return pd.read_sql_query(
-            """
-            SELECT log_id, event_timestamp, event_type, session_uuid,
-                   participant_index, team_id, dominio, outcome, details
-            FROM insertion_logs
-            ORDER BY log_id DESC
-            """,
-            con,
-        )
-    finally:
-        con.close()
+    records = _sheet_records(get_log_sheet())
+    if not records:
+        return pd.DataFrame(columns=["log_id"] + LOG_HEADERS)
+    df = pd.DataFrame(records)
+    df.insert(0, "log_id", range(1, len(df) + 1))
+    return df.iloc[::-1].reset_index(drop=True)
 
 
 def reset_database() -> None:
+    """Cancella risposte e prenotazioni anche dal foglio persistente; conserva il Log."""
+    responses_ws = get_risposte_sheet()
+    reservations_ws = get_prenotazioni_sheet()
+
+    responses_ws.clear()
+    responses_ws.append_row(list(expected_columns().keys()), value_input_option="RAW")
+    reservations_ws.clear()
+    reservations_ws.append_row(PRENOTAZIONI_HEADERS, value_input_option="RAW")
+
     con = get_conn()
     try:
         con.execute("DELETE FROM risposte")
@@ -1534,11 +1874,18 @@ def reset_database() -> None:
         con.commit()
     finally:
         con.close()
+
     for path in [CSV_RESPONSES, EXCEL_RESPONSES]:
         try:
             path.unlink(missing_ok=True)
         except OSError:
             pass
+
+    log_event(
+        event_type="rilevazione_aperta",
+        outcome="ok",
+        details="Reset completo: risposte e prenotazioni eliminate; log conservato.",
+    )
 
 
 # ============================================================
@@ -2244,6 +2591,90 @@ if ADMIN_PWD is not None and admin == ADMIN_PWD:
         email_cfg["destinatario"] if email_cfg else "Non configurata",
     )
 
+    with st.expander("📥 Importa risposte già acquisite in Google Sheets"):
+        st.caption(
+            "Usa questa funzione una sola volta per trasferire gli Excel precedenti. "
+            "Le righe già presenti, riconosciute tramite session_uuid o participant_index, "
+            "non vengono duplicate."
+        )
+        historical_file = st.file_uploader(
+            "Seleziona un file Excel storico",
+            type=["xlsx"],
+            key="historical_excel_import",
+        )
+        if historical_file is not None and st.button(
+            "Importa nel foglio Risposte",
+            key="import_historical_excel_button",
+        ):
+            try:
+                historical_df = pd.read_excel(historical_file, sheet_name="Risposte")
+                required_headers = list(expected_columns().keys())
+                missing_headers = [
+                    column for column in required_headers
+                    if column not in historical_df.columns
+                ]
+                if missing_headers:
+                    raise ValueError(
+                        "Il file non è compatibile. Colonne mancanti: "
+                        + ", ".join(missing_headers[:15])
+                    )
+
+                ws = get_risposte_sheet()
+                existing = load_risposte()
+                existing_uuids = set(
+                    existing.get("session_uuid", pd.Series(dtype=str))
+                    .astype(str)
+                    .replace("", np.nan)
+                    .dropna()
+                )
+                existing_indices = set(
+                    pd.to_numeric(
+                        existing.get("participant_index", pd.Series(dtype=float)),
+                        errors="coerce",
+                    ).dropna().astype(int)
+                )
+
+                imported = 0
+                skipped = 0
+                for _, historical_row in historical_df.iterrows():
+                    row_dict = {
+                        column: _clean_sheet_value(historical_row.get(column, ""))
+                        for column in required_headers
+                    }
+                    session_uuid = str(row_dict.get("session_uuid", ""))
+                    participant_raw = row_dict.get("participant_index", "")
+                    try:
+                        participant_index = int(float(participant_raw))
+                    except (TypeError, ValueError):
+                        skipped += 1
+                        continue
+
+                    if (
+                        (session_uuid and session_uuid in existing_uuids)
+                        or participant_index in existing_indices
+                    ):
+                        skipped += 1
+                        continue
+
+                    _append_dict(ws, row_dict, ws.row_values(1))
+                    existing_indices.add(participant_index)
+                    if session_uuid:
+                        existing_uuids.add(session_uuid)
+                    imported += 1
+
+                log_event(
+                    event_type="importazione_storica",
+                    outcome="ok",
+                    details=f"Importate {imported} righe; ignorate {skipped} righe.",
+                )
+                st.success(
+                    f"Importazione completata: {imported} risposte aggiunte; "
+                    f"{skipped} ignorate perché duplicate o non valide."
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Importazione non completata: {exc}")
+
     if not df.empty:
         st.subheader("Distribuzione del campione")
         domain_counts = (
@@ -2755,7 +3186,7 @@ if all(st.session_state.get(f"{t}_completed", False) for t in CONDIZIONI):
                 )
                 clear_participant_state()
                 st.rerun()
-            except (sqlite3.Error, RuntimeError, ValueError, OSError) as exc:
+            except (sqlite3.Error, RuntimeError, ValueError, OSError, gspread.GSpreadException) as exc:
                 try:
                     log_event(
                         event_type="errore_inserimento",
