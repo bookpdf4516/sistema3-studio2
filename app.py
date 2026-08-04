@@ -1568,6 +1568,61 @@ def init_db() -> None:
         con.close()
 
 
+NUMERIC_BASE_COLUMNS = {
+    "participant_index",
+    "team_id",
+    "posizione_team",
+    "coordination",
+    "domain_experience",
+    "ai_use",
+    "ai_critical",
+    "ai_llm_use",
+    "ai_llm_trust",
+}
+
+NUMERIC_T_SUFFIXES = {
+    "ai_reference",
+    "pre_ai",
+    "conf_pre",
+    "post_ai",
+    "llm_utile",
+    "trust_ai",
+    "confidence",
+    "leader_acceptance",
+    "need_group",
+    "gravity",
+    "uncertainty",
+    "strategic",
+    "pressione_1",
+    "pressione_2",
+    "pressione_3",
+    "critica_llm",
+    "delta_raw",
+    "convergence_C",
+    "appropriate_reliance_AR",
+    "cognitive_surrender_CS",
+    "pressure_P",
+    "context_G",
+    "hierarchy_H",
+    "flexibility_F",
+}
+
+
+def coerce_numeric_response_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Converte in numerico i campi restituiti da Google Sheets come testo."""
+    result = df.copy()
+    numeric_columns = set(NUMERIC_BASE_COLUMNS)
+
+    for t in CONDIZIONI:
+        numeric_columns.update(f"{t}_{suffix}" for suffix in NUMERIC_T_SUFFIXES)
+
+    for column in numeric_columns:
+        if column in result.columns:
+            result[column] = pd.to_numeric(result[column], errors="coerce")
+
+    return result
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_risposte() -> pd.DataFrame:
     """Carica le risposte dall'archivio persistente Google Sheets."""
@@ -1583,9 +1638,7 @@ def load_risposte() -> pd.DataFrame:
             df[column] = np.nan
     df = df[columns]
 
-    for column in ["participant_index", "team_id", "posizione_team"]:
-        if column in df.columns:
-            df[column] = pd.to_numeric(df[column], errors="coerce")
+    df = coerce_numeric_response_columns(df)
 
     return df.sort_values(
         ["participant_index", "timestamp"],
@@ -2591,7 +2644,7 @@ if ADMIN_PWD is not None and admin == ADMIN_PWD:
     )
 
     st.header("Back Office — Studio 2")
-    df = load_risposte()
+    df = coerce_numeric_response_columns(load_risposte())
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Risposte acquisite", len(df))
@@ -2627,6 +2680,7 @@ if ADMIN_PWD is not None and admin == ADMIN_PWD:
         ):
             try:
                 historical_df = pd.read_excel(historical_file, sheet_name="Risposte")
+                historical_df = coerce_numeric_response_columns(historical_df)
                 required_headers = list(expected_columns().keys())
                 missing_headers = [
                     column for column in required_headers
