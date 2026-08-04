@@ -1426,6 +1426,134 @@ def get_log_sheet():
     return _worksheet(LOG_SHEET, LOG_HEADERS)
 
 
+def _safe_backup_title(prefix: str, timestamp: str) -> str:
+    """Crea un titolo breve e valido per un foglio di backup."""
+    return f"{prefix}_{timestamp}"[:100]
+
+
+def create_google_backup(reason: str) -> tuple[str, str]:
+    """Crea copie persistenti di Risposte e Prenotazioni nello stesso spreadsheet."""
+    spreadsheet = get_google_spreadsheet()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    responses_ws = get_risposte_sheet()
+    reservations_ws = get_prenotazioni_sheet()
+
+    responses_values = responses_ws.get_all_values()
+    reservations_values = reservations_ws.get_all_values()
+
+    responses_title = _safe_backup_title("Backup_Risposte", stamp)
+    reservations_title = _safe_backup_title("Backup_Prenotazioni", stamp)
+
+    backup_responses = spreadsheet.add_worksheet(
+        title=responses_title,
+        rows=max(2, len(responses_values) + 5),
+        cols=max(5, len(responses_values[0]) + 2 if responses_values else 5),
+    )
+    backup_reservations = spreadsheet.add_worksheet(
+        title=reservations_title,
+        rows=max(2, len(reservations_values) + 5),
+        cols=max(5, len(reservations_values[0]) + 2 if reservations_values else 5),
+    )
+
+    if responses_values:
+        backup_responses.update(
+            range_name=f"A1:{gspread.utils.rowcol_to_a1(len(responses_values), len(responses_values[0]))}",
+            values=responses_values,
+            value_input_option="RAW",
+        )
+    if reservations_values:
+        backup_reservations.update(
+            range_name=f"A1:{gspread.utils.rowcol_to_a1(len(reservations_values), len(reservations_values[0]))}",
+            values=reservations_values,
+            value_input_option="RAW",
+        )
+
+    log_event(
+        event_type="backup_google_sheets",
+        outcome="ok",
+        details=(
+            f"Backup creato prima di '{reason}': "
+            f"{responses_title}, {reservations_title}."
+        ),
+    )
+    return responses_title, reservations_title
+
+
+def reconcile_missing_reservations() -> dict[str, int]:
+    """Ricostruisce le prenotazioni mancanti usando il foglio Risposte.
+
+    Le analisi continuano a usare esclusivamente Risposte. Questa funzione
+    serve solo a mantenere coerente la gestione operativa delle sessioni.
+    """
+    responses = load_risposte()
+    reservations_ws = get_prenotazioni_sheet()
+    reservation_records = _sheet_records(reservations_ws)
+
+    existing_indices: set[int] = set()
+    existing_tokens: set[str] = set()
+    for record in reservation_records:
+        try:
+            existing_indices.add(int(float(record.get("participant_index", ""))))
+        except (TypeError, ValueError):
+            pass
+        token = str(record.get("session_token", "")).strip()
+        if token:
+            existing_tokens.add(token)
+
+    created = 0
+    skipped = 0
+
+    if responses.empty:
+        return {"created": 0, "skipped": 0}
+
+    for _, response in responses.iterrows():
+        try:
+            participant_index = int(response["participant_index"])
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+
+        if participant_index in existing_indices:
+            skipped += 1
+            continue
+
+        timestamp = str(response.get("timestamp", "")).strip()
+        if not timestamp:
+            timestamp = datetime.now().isoformat(timespec="seconds")
+
+        session_uuid = str(response.get("session_uuid", "")).strip()
+        token_base = f"storico-{participant_index}-{session_uuid[:8] or 'senza-uuid'}"
+        token = token_base
+        suffix = 1
+        while token in existing_tokens:
+            suffix += 1
+            token = f"{token_base}-{suffix}"
+
+        _append_dict(
+            reservations_ws,
+            {
+                "session_token": token,
+                "participant_index": participant_index,
+                "created_at": timestamp,
+                "status": "completata",
+                "completed_at": timestamp,
+            },
+            PRENOTAZIONI_HEADERS,
+        )
+        existing_indices.add(participant_index)
+        existing_tokens.add(token)
+        created += 1
+
+    if created:
+        log_event(
+            event_type="ricostruzione_prenotazioni",
+            outcome="ok",
+            details=f"Create {created} prenotazioni mancanti; già presenti {skipped}.",
+        )
+
+    return {"created": created, "skipped": skipped}
+
+
 def _sheet_records(ws) -> list[dict[str, Any]]:
     try:
         return ws.get_all_records(
@@ -1685,6 +1813,8 @@ def is_closed() -> bool:
 
 
 def set_closed(value: bool) -> None:
+    if value:
+        create_google_backup("chiusura_rilevazione")
     log_event(
         event_type="rilevazione_chiusa" if value else "rilevazione_aperta",
         outcome="ok",
@@ -1929,7 +2059,8 @@ def load_insertion_logs() -> pd.DataFrame:
 
 
 def reset_database() -> None:
-    """Cancella risposte e prenotazioni anche dal foglio persistente; conserva il Log."""
+    """Cancella risposte e prenotazioni; prima crea un backup persistente."""
+    create_google_backup("reset_completo")
     responses_ws = get_risposte_sheet()
     reservations_ws = get_prenotazioni_sheet()
 
@@ -2644,6 +2775,22 @@ if ADMIN_PWD is not None and admin == ADMIN_PWD:
     )
 
     st.header("Back Office — Studio 2")
+
+    if not st.session_state.get("integrity_check_completed", False):
+        try:
+            integrity_result = reconcile_missing_reservations()
+            st.session_state["integrity_check_completed"] = True
+            if integrity_result["created"] > 0:
+                st.success(
+                    f"Controllo di integrità completato: "
+                    f"{integrity_result['created']} prenotazioni mancanti ricostruite."
+                )
+        except Exception as exc:
+            st.warning(
+                "Il controllo delle prenotazioni non è stato completato: "
+                f"{exc}"
+            )
+
     df = coerce_numeric_response_columns(load_risposte())
 
     c1, c2, c3, c4 = st.columns(4)
@@ -2663,6 +2810,26 @@ if ADMIN_PWD is not None and admin == ADMIN_PWD:
         email_cfg["destinatario"] if email_cfg else "Non configurata",
     )
 
+    with st.expander("🛠️ Integrità del database"):
+        st.caption(
+            "Le statistiche, l'ABM e il Monte Carlo usano esclusivamente il foglio "
+            "Risposte. Questo controllo ricostruisce soltanto le prenotazioni mancanti."
+        )
+        if st.button(
+            "Verifica e ricostruisci prenotazioni mancanti",
+            key="manual_integrity_check",
+        ):
+            try:
+                result = reconcile_missing_reservations()
+                st.success(
+                    f"Controllo concluso: {result['created']} prenotazioni create; "
+                    f"{result['skipped']} già presenti."
+                )
+                st.session_state["integrity_check_completed"] = True
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Controllo non completato: {exc}")
+
     with st.expander("📥 Importa risposte già acquisite in Google Sheets"):
         st.caption(
             "Usa questa funzione una sola volta per trasferire gli Excel precedenti. "
@@ -2679,6 +2846,7 @@ if ADMIN_PWD is not None and admin == ADMIN_PWD:
             key="import_historical_excel_button",
         ):
             try:
+                create_google_backup("importazione_storica")
                 historical_df = pd.read_excel(historical_file, sheet_name="Risposte")
                 historical_df = coerce_numeric_response_columns(historical_df)
                 required_headers = list(expected_columns().keys())
@@ -2730,6 +2898,26 @@ if ADMIN_PWD is not None and admin == ADMIN_PWD:
                         continue
 
                     _append_dict(ws, row_dict, ws.row_values(1))
+
+                    timestamp_value = str(row_dict.get("timestamp", "")).strip()
+                    if not timestamp_value:
+                        timestamp_value = datetime.now().isoformat(timespec="seconds")
+                    reservation_token = (
+                        f"storico-{participant_index}-"
+                        f"{session_uuid[:8] if session_uuid else 'senza-uuid'}"
+                    )
+                    _append_dict(
+                        get_prenotazioni_sheet(),
+                        {
+                            "session_token": reservation_token,
+                            "participant_index": participant_index,
+                            "created_at": timestamp_value,
+                            "status": "completata",
+                            "completed_at": timestamp_value,
+                        },
+                        PRENOTAZIONI_HEADERS,
+                    )
+
                     existing_indices.add(participant_index)
                     if session_uuid:
                         existing_uuids.add(session_uuid)
@@ -2852,6 +3040,10 @@ if ADMIN_PWD is not None and admin == ADMIN_PWD:
             )
 
         st.subheader("Sintesi degli esiti sperimentali")
+        st.caption(
+            "Statistiche descrittive, ABM e Monte Carlo sono calcolati esclusivamente "
+            "sulle righe del foglio Risposte. Prenotazioni e Log non entrano nei calcoli."
+        )
         summary_rows = []
         for t in CONDIZIONI:
             for (domain, quality), group in df.groupby(["dominio", f"{t}_output_quality"]):
