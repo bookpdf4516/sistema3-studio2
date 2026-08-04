@@ -1411,14 +1411,17 @@ def _worksheet(name: str, headers: list[str]):
     return ws
 
 
+@st.cache_resource(show_spinner=False)
 def get_risposte_sheet():
     return _worksheet(RISPOSTE_SHEET, list(expected_columns().keys()))
 
 
+@st.cache_resource(show_spinner=False)
 def get_prenotazioni_sheet():
     return _worksheet(PRENOTAZIONI_SHEET, PRENOTAZIONI_HEADERS)
 
 
+@st.cache_resource(show_spinner=False)
 def get_log_sheet():
     return _worksheet(LOG_SHEET, LOG_HEADERS)
 
@@ -1456,6 +1459,8 @@ def _append_dict(ws, row: dict[str, Any], headers: list[str]) -> None:
         [_clean_sheet_value(row.get(column, "")) for column in headers],
         value_input_option="RAW",
     )
+    load_risposte.clear()
+    _latest_collection_state.clear()
 
 
 def _find_row_by_value(ws, column_name: str, value: Any) -> tuple[int, dict[str, Any]] | None:
@@ -1475,6 +1480,8 @@ def _update_sheet_cell_by_header(ws, row_number: int, header: str, value: Any) -
     if header not in headers:
         raise RuntimeError(f"Colonna '{header}' assente nel foglio '{ws.title}'.")
     ws.update_cell(row_number, headers.index(header) + 1, _clean_sheet_value(value))
+    load_risposte.clear()
+    _latest_collection_state.clear()
 
 
 def _sync_row_to_local_sqlite(row: dict[str, Any]) -> None:
@@ -1561,6 +1568,7 @@ def init_db() -> None:
         con.close()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def load_risposte() -> pd.DataFrame:
     """Carica le risposte dall'archivio persistente Google Sheets."""
     ws = get_risposte_sheet()
@@ -1592,6 +1600,7 @@ def completed_count() -> int:
     return int(df["session_uuid"].astype(str).replace("", np.nan).dropna().nunique())
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def _latest_collection_state() -> bool | None:
     """Restituisce True=chiusa, False=aperta, None=nessuna impostazione."""
     ws = get_log_sheet()
@@ -1606,10 +1615,20 @@ def _latest_collection_state() -> bool | None:
 
 
 def is_closed() -> bool:
-    explicit = _latest_collection_state()
-    if explicit is not None:
-        return explicit
-    return completed_count() >= MAX_P
+    try:
+        explicit = _latest_collection_state()
+        if explicit is not None:
+            return explicit
+        return completed_count() >= MAX_P
+    except gspread.exceptions.APIError as exc:
+        # Evita il blocco dell'intera app in caso di quota temporaneamente esaurita.
+        if getattr(exc, "response", None) is not None and exc.response.status_code == 429:
+            st.warning(
+                "Google Sheets ha raggiunto temporaneamente il limite di lettura. "
+                "Attendi circa un minuto e ricarica la pagina."
+            )
+            st.stop()
+        raise
 
 
 def set_closed(value: bool) -> None:
@@ -2877,7 +2896,7 @@ if st.session_state.get("submission_success"):
         st.rerun()
     st.stop()
 
-if is_closed() or completed_count() >= MAX_P:
+if is_closed():
     st.info("La rilevazione è terminata. Grazie per l'interesse.")
     st.stop()
 
