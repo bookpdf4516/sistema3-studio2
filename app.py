@@ -2688,18 +2688,23 @@ def figure_to_png(fig: plt.Figure, dpi: int = 300) -> bytes:
 def show_llm_output(dominio: str, t: str, quality: str) -> dict[str, Any]:
     """Mostra al partecipante soltanto l'analisi argomentata del modello.
 
-    La stima quantitativa, la valutazione ordinale e la qualità sperimentale
-    dell'output restano nascoste nell'interfaccia e vengono conservate nel
-    database esclusivamente per le successive analisi.
+    Il testo in prosa proviene da LLM_TESTI (27 testi scritti in forma
+    argomentata continua). La stima quantitativa, la valutazione ordinale
+    e la qualità sperimentale dell'output restano nascoste nell'interfaccia
+    e vengono conservate nel database esclusivamente per le successive analisi.
     """
     output = llm_output(dominio, t, quality)
+    # Recupera il testo in prosa precompilato; usa il testo assemblato
+    # come fallback nel caso in cui la chiave non fosse disponibile.
+    quality_key = {"calibrato": "C", "sovrastimante": "S", "sottostimante": "U"}[quality]
+    prose = LLM_TESTI.get(dominio, {}).get(t, {}).get(quality_key, output["analysis"])
     st.info(
         "**Sistema di supporto analitico — output precompilato del modello linguistico**\n\n"
         "Il modello ha elaborato le stesse informazioni del briefing e presenta "
         "la propria analisi argomentata."
     )
     st.markdown("### Analisi argomentata")
-    st.markdown(output["analysis"])
+    st.markdown(prose)
     return output
 
 
