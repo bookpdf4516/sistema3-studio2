@@ -2688,23 +2688,18 @@ def figure_to_png(fig: plt.Figure, dpi: int = 300) -> bytes:
 def show_llm_output(dominio: str, t: str, quality: str) -> dict[str, Any]:
     """Mostra al partecipante soltanto l'analisi argomentata del modello.
 
-    Il testo in prosa proviene da LLM_TESTI (27 testi scritti in forma
-    argomentata continua). La stima quantitativa, la valutazione ordinale
-    e la qualità sperimentale dell'output restano nascoste nell'interfaccia
-    e vengono conservate nel database esclusivamente per le successive analisi.
+    La stima quantitativa, la valutazione ordinale e la qualità sperimentale
+    dell'output restano nascoste nell'interfaccia e vengono conservate nel
+    database esclusivamente per le successive analisi.
     """
     output = llm_output(dominio, t, quality)
-    # Recupera il testo in prosa precompilato; usa il testo assemblato
-    # come fallback nel caso in cui la chiave non fosse disponibile.
-    quality_key = {"calibrato": "C", "sovrastimante": "S", "sottostimante": "U"}[quality]
-    prose = LLM_TESTI.get(dominio, {}).get(t, {}).get(quality_key, output["analysis"])
     st.info(
         "**Sistema di supporto analitico — output precompilato del modello linguistico**\n\n"
         "Il modello ha elaborato le stesse informazioni del briefing e presenta "
         "la propria analisi argomentata."
     )
     st.markdown("### Analisi argomentata")
-    st.markdown(prose)
+    st.markdown(output["analysis"])
     return output
 
 
@@ -2812,6 +2807,9 @@ def validate_final_answers() -> list[str]:
 def torna_al_questionario() -> None:
     """Esce dal back office azzerando il campo password in modo compatibile con Streamlit."""
     st.session_state["admin_password_input"] = ""
+
+
+NUOVO_QUESTIONARIO_URL = "https://tinyurl.com/sistema3-studio2"
 
 
 init_db()
@@ -3201,6 +3199,38 @@ if ADMIN_PWD is not None and admin == ADMIN_PWD:
 # ------------------------------------------------------------
 # QUESTIONARIO PARTECIPANTE
 # ------------------------------------------------------------
+
+st.header("Questionario online")
+st.markdown(
+    "Il questionario dello **Studio 2** è ora disponibile nella nuova applicazione, "
+    "ottimizzata anche per smartphone e tablet."
+)
+
+try:
+    st.link_button(
+        "Apri il nuovo questionario",
+        NUOVO_QUESTIONARIO_URL,
+        type="primary",
+        use_container_width=True,
+    )
+except AttributeError:
+    # Compatibilità con versioni di Streamlit precedenti a st.link_button.
+    st.markdown(
+        f"""
+        <a href="{NUOVO_QUESTIONARIO_URL}" target="_blank" rel="noopener noreferrer"
+           style="display:block;width:100%;box-sizing:border-box;padding:0.75rem 1rem;
+                  border-radius:0.5rem;background:#1f77b4;color:white;text-align:center;
+                  text-decoration:none;font-weight:700;">
+            Apri il nuovo questionario
+        </a>
+        """,
+        unsafe_allow_html=True,
+    )
+
+st.caption(
+    "Il back-office rimane disponibile inserendo la password nella barra laterale."
+)
+st.stop()
 
 if st.session_state.get("submission_success"):
     st.success(
